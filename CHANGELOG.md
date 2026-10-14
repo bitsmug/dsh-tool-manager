@@ -9,6 +9,19 @@
 
 - 工具组可标记为“默认开放”：该组在所属 Preset 的每个会话第一步就直接开放，无需模型先调用 `tool_list`；默认开放组仍保留在工具组目录中并标记为已开放。WebUI 分组列表新增“默认开放”开关，配置字段为 `groups[].alwaysOpen`（只认字面量 `true`，缺省、`false` 与其它值均按普通按需组处理）。默认开放不覆盖 `disabled`：显式关闭的工具即使属于默认开放组也仍然隐藏。
 
+## [1.2.10] - 2026-10-08
+
+### Fixed
+
+- 修复保存按需分组时把「只按 Agent 作用域注册」的工具误判为空组、导致无法保存的问题。典型表现：为 `@deepseek-ai/dsh-schedule` 提供的 `schedule_create` / `schedule_list` / `schedule_delete` / `schedule_update` 建组后点保存，报 `Preset "standard" has empty tool groups: "定时提醒管理"`，而页面明明列出了这些工具、`tool_list` 也能正常打开该组。根因是保存校验只读 Preset 的 standing composition（`acquireScope()`），而页面目录是 standing 与 Agent 作用域注册（探针 + 运行中 Agent 观测）的并集；`subagent` 等由 `modelSelectionSettings` 注入的工具同样受影响。现在校验与页面使用同一份目录，并且只在真正读不到 standing composition 时才跳过该校验。同时修正了同一根因下的两个次生问题：仅含 Agent 作用域工具的组里出现已关闭成员时误报「空组」而非「已关闭工具不能入组」，以及两个此类组之间的重复成员漏检。
+
+## [1.2.9] - 2026-10-08
+
+### Changed
+
+- 适配 DSH 0.2.0-rc.2：`engines.dsh` 提升为 `>=0.2.0-rc.2`，README 同步标明适配范围；旧版本请继续使用 `1.2.8`。
+- 工具管理页「工具目录」面板补充说明：`tool_list` 只在当前 Preset 有有效按需组时才出现（保存后从下一个模型步骤生效），没有有效按需组时模型看不到它；并说明它由插件自动管理，不出现在本页工具目录中，也不能在本页开关或分组。
+
 ## [1.2.8] - 2026-09-23
 
 ### Changed
