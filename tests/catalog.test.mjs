@@ -12,6 +12,7 @@ import {
   renderCatalogMessage,
   renderCatalogText,
 } from "../dist/catalog.js";
+import { listGroupViews, resolveActiveGroups } from "../dist/policy.js";
 
 const groups = [
   { name: "GitHub MCP", description: "GitHub tools", tools: ["mcp__github__issue", "mcp__github__pull"] },
@@ -227,5 +228,31 @@ describe("tool-manager catalog", () => {
   it("leaves reject decisions untouched", () => {
     const reject = { kind: "reject" };
     assert.equal(applyCatalogDecision(reject, catalogEntriesFromGroups(groups), { published: false }), reject);
+  });
+
+  it("keeps an always-open group in the catalog while listing it as exposed", () => {
+    const names = ["read", "web_search", "mcp__github__issue"];
+    const policy = {
+      disabled: [],
+      groups: [
+        { name: "GitHub MCP", description: "GitHub tools", patterns: ["mcp__*"], alwaysOpen: true },
+        { name: "搜索工具", patterns: ["web_search"] },
+      ],
+    };
+    const active = resolveActiveGroups(policy, names);
+
+    assert.deepEqual(active.map((group) => group.name), ["GitHub MCP", "搜索工具"]);
+    assert.deepEqual(catalogEntriesFromGroups(active), [
+      { name: "GitHub MCP", description: "GitHub tools", tools: ["mcp__github__issue"] },
+      { name: "搜索工具", description: "", tools: ["web_search"] },
+    ]);
+    assert.deepEqual(listGroupViews(active, new Set()), [
+      { name: "GitHub MCP", description: "GitHub tools", exposed: true },
+      { name: "搜索工具", exposed: false },
+    ]);
+    assert.deepEqual(listGroupViews(active, new Set(["搜索工具"])), [
+      { name: "GitHub MCP", description: "GitHub tools", exposed: true },
+      { name: "搜索工具", exposed: true },
+    ]);
   });
 });

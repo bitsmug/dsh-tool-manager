@@ -27,6 +27,7 @@ window.__ModuleLoader__.load({
 			".tm_group_main{appearance:none;border:0;background:transparent;color:inherit;text-align:left;flex:1;min-width:0;cursor:pointer;padding:0}",
 			".tm_group_title{font-size:13px;font-weight:600;line-height:1.3}.tm_group_sub{font-size:11px;color:var(--dsw-alias-label-secondary,#9097a4);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
 			".tm_group_count{flex:0 0 auto;font-size:12px;color:var(--dsw-alias-label-secondary,#9097a4)}",
+			".tm_switch{display:inline-flex;align-items:center;gap:6px;flex:0 0 auto;font-size:12px;color:var(--dsw-alias-label-secondary,#9097a4);cursor:pointer;white-space:nowrap}",
 			".tm_group_body{padding:0 14px 12px 50px}",
 			".tm_member{padding:7px 0;border-bottom:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.08))}.tm_member:last-child{border-bottom:0}",
 			".tm_modal{position:fixed;inset:0;z-index:10000;display:flex;align-items:center;justify-content:center;padding:24px}",
@@ -81,6 +82,7 @@ window.__ModuleLoader__.load({
 					name: group.name,
 					...(group.description ? { description: group.description } : {}),
 					patterns: [...(group.patterns || [])],
+					...(group.alwaysOpen === true ? { alwaysOpen: true } : {}),
 				})),
 			};
 		}
@@ -263,6 +265,14 @@ window.__ModuleLoader__.load({
 					const disabled = new Set(target.policy.disabled || []);
 					if (disabled.has(name)) disabled.delete(name); else disabled.add(name);
 					target.policy.disabled = [...disabled];
+				});
+			}
+
+			function toggleAlwaysOpen(key) {
+				mutatePreset((target) => {
+					const group = (target.policy.groups || []).find((item) => item._key === key);
+					if (!group) return;
+					if (group.alwaysOpen === true) delete group.alwaysOpen; else group.alwaysOpen = true;
 				});
 			}
 
@@ -570,16 +580,23 @@ window.__ModuleLoader__.load({
 			function renderGroup(group) {
 				const key = group._key;
 				const open = !!expanded[key];
+				const alwaysOpen = group.alwaysOpen === true;
 				const members = matchingTools(preset.tools, group.patterns);
 				const title = (group.name || "").trim() || "未命名分组";
 				return h("div", { className: "tm_group", key: key },
 					h("div", { className: "tm_group_bar" },
 						h("button", { className: "tm_chevron", title: open ? "收起" : "展开", onClick: () => setExpanded((current) => ({ ...current, [key]: !current[key] })) }, open ? "▾" : "▸"),
 						h("button", { className: "tm_group_main", onClick: () => setExpanded((current) => ({ ...current, [key]: !current[key] })) },
-							h("div", { className: "tm_group_title" }, title, h("span", { className: "tm_badge cold" }, "按需")),
+							h("div", { className: "tm_group_title" }, title, alwaysOpen
+								? h("span", { className: "tm_badge live" }, "默认开放")
+								: h("span", { className: "tm_badge cold" }, "按需")),
 							h("div", { className: "tm_group_sub" }, group.description || "没有描述"),
 						),
 						h("span", { className: "tm_group_count" }, members.length + " 个工具"),
+						h("label", { className: "tm_switch", title: "默认开放：本 Preset 的每个会话从一开始就开放这个分组，无需 tool_list；不覆盖已关闭的工具。" },
+							h("input", { type: "checkbox", checked: alwaysOpen, onChange: () => toggleAlwaysOpen(key) }),
+							h("span", null, "默认开放"),
+						),
 						h("button", { className: "tm_btn", onClick: () => openEdit(group) }, "编辑"),
 						h("button", { className: "tm_btn", onClick: () => deleteGroup(key) }, "删除"),
 					),

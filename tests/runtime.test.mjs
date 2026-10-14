@@ -201,6 +201,80 @@ describe("ToolPolicyRuntime restart recovery", () => {
     await runtime.dispose();
   });
 
+  it("exposes an always-open group from the first step and still defers the rest to tool_list", async () => {
+    const schemas = ["tool_list", "read", "mcp__search", "web_fetch"].map((name) => ({
+      name,
+      description: name,
+      parameters: {},
+    }));
+    let guard;
+    let assemble;
+    let discovery;
+    const scopedTools = {
+      schemas() { return schemas; },
+      register() { throw new Error("scope register should not be used"); },
+      restrict() { return () => {}; },
+      guard(callback) { guard = callback; return () => {}; },
+    };
+    const agent = {
+      ctx: {
+        get(name) { return name === "tools" ? scopedTools : undefined; },
+        on(name, handler) {
+          if (name === "system-prompt/assemble") assemble = handler;
+          return () => {};
+        },
+      },
+      session: resumedSession(),
+    };
+    const context = {
+      get(name) {
+        if (name === "tools") return {
+          schemas() { return schemas; },
+          register(definition) { discovery = definition; return () => {}; },
+        };
+        if (name === "agents") return { list: () => [agent] };
+        return undefined;
+      },
+      on() {},
+    };
+    const presets = { composedPreset: () => "standard" };
+    const runtime = new ToolPolicyRuntime(context, presets, {
+      presets: {
+        standard: {
+          disabled: [],
+          groups: [
+            { name: "Readonly", patterns: ["read"], alwaysOpen: true },
+            { name: "MCP", patterns: ["mcp__*"] },
+          ],
+        },
+      },
+    });
+    runtime.start();
+
+    const assembly = () => ({
+      tools: schemas,
+      sections: schemas.map((item) => ({ name: `tool:${item.name}` })),
+      contexts: [],
+      variables: {},
+    });
+    const newSessionVisible = (await assemble({}, {}, async () => assembly()))
+      .tools.map((item) => item.name);
+
+    assert.equal(typeof assemble, "function");
+    assert.deepEqual(newSessionVisible, ["tool_list", "read", "web_fetch"]);
+    assert.equal(guard({ name: "read" }), undefined);
+    assert.match(guard({ name: "mcp__search" }), /belongs to on-demand group "MCP" which is not open/);
+
+    await discovery.execute({ group: "MCP" }, { agent });
+
+    assert.deepEqual(
+      (await assemble({}, {}, async () => assembly())).tools.map((item) => item.name),
+      ["tool_list", "read", "mcp__search", "web_fetch"],
+    );
+    assert.equal(guard({ name: "mcp__search" }), undefined);
+    await runtime.dispose();
+  });
+
   it("keeps standard delegation policy isolated from creator sessions and restores it", async () => {
     const schemas = ["tool_list", "read", "list_subagent_models", "subagent"].map((name) => ({
       name,

@@ -44,6 +44,7 @@ export function normalizePresetPolicy(value: unknown): PresetToolPolicy {
       name,
       ...(description ? { description } : {}),
       patterns: uniqueStrings(group?.patterns),
+      ...(group?.alwaysOpen === true ? { alwaysOpen: true } : {}),
     });
   }
 
@@ -67,6 +68,7 @@ export function resolveGroups(
     ...(group.description ? { description: group.description } : {}),
     patterns: [...group.patterns],
     tools: toolNames.filter((name) => isGroupableTool(name) && matchesAnyPattern(name, group.patterns)),
+    ...(group.alwaysOpen === true ? { alwaysOpen: true } : {}),
   }));
 }
 
@@ -141,6 +143,10 @@ export function hiddenTools(
  * every explicit disable. The PTC transport is never denied. `tool_list` is
  * registered globally so PTC's SDK can bind it. Presets with no active
  * (non-empty) on-demand groups hide it here so restrict() can deny the inherited name.
+ *
+ * Always-open groups contribute no hidden members: their tools are open from
+ * the first step. The `disabled` loop is independent and still runs for them,
+ * so an explicitly disabled tool stays hidden even inside an always-open group.
  */
 export function denyNames(
   policy: PresetToolPolicy,
@@ -152,6 +158,7 @@ export function denyNames(
   const open = new Set([...exposures].map((name) => name.toLowerCase()));
 
   for (const group of groups) {
+    if (group.alwaysOpen) continue;
     if (open.has(group.name.toLowerCase())) continue;
     for (const name of group.tools) hidden.add(name);
   }
@@ -191,7 +198,7 @@ export function listGroupViews(
   return groups.map((group) => ({
     name: group.name,
     ...(group.description ? { description: group.description } : {}),
-    exposed: open.has(group.name.toLowerCase()),
+    exposed: group.alwaysOpen === true || open.has(group.name.toLowerCase()),
   }));
 }
 

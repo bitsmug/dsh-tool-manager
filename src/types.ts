@@ -12,6 +12,12 @@ export interface ToolGroupPolicy {
   description?: string;
   /** Exact tool names and optional `*` wildcard patterns from older configs. */
   patterns: string[];
+  /**
+   * Always open: this group is open from the first step of every session on
+   * this preset, with no `tool_list` call. Only a literal `true` enables it.
+   * An explicit `disabled` entry still wins over an always-open group.
+   */
+  alwaysOpen?: boolean;
 }
 
 export interface PresetToolPolicy {
@@ -36,6 +42,8 @@ export interface ResolvedGroupView {
   description?: string;
   patterns: string[];
   tools: string[];
+  /** Mirrors the policy flag so the catalog and WebUI can render it. */
+  alwaysOpen?: boolean;
 }
 
 export interface PresetOrphans {

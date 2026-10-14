@@ -192,4 +192,117 @@ describe("tool-manager policy", () => {
     assert.deepEqual([...(parseKnownRestrictable(error) ?? [])], ["read", "write"]);
     assert.equal(parseKnownRestrictable(new Error("boom")), undefined);
   });
+
+  describe("alwaysOpen groups", () => {
+    const names = ["read", "web_fetch", "tool_list", "mcp__git__status", "mcp__db__query"];
+
+    it("never hides the members of an always-open group", () => {
+      const policy = {
+        disabled: [],
+        groups: [{ name: "mcp", patterns: ["mcp__*"], alwaysOpen: true }],
+      };
+      assert.deepEqual(denyNames(policy, names, new Set()), []);
+      assert.deepEqual(denyNames(policy, names, new Set(["mcp"])), []);
+    });
+
+    it("keeps an explicitly disabled tool hidden inside an always-open group", () => {
+      const policy = {
+        disabled: ["mcp__git__status"],
+        groups: [{ name: "mcp", patterns: ["mcp__*"], alwaysOpen: true }],
+      };
+      assert.deepEqual(denyNames(policy, names, new Set()), ["mcp__git__status"]);
+    });
+
+    it("changes nothing when the flag is absent, false, or not a boolean", () => {
+      const closed = {
+        disabled: [],
+        groups: [{ name: "mcp", patterns: ["mcp__*"] }],
+      };
+      assert.deepEqual(denyNames(closed, names, new Set()), ["mcp__git__status", "mcp__db__query"]);
+      assert.deepEqual(
+        denyNames({ ...closed, groups: [{ name: "mcp", patterns: ["mcp__*"], alwaysOpen: false }] }, names, new Set()),
+        ["mcp__git__status", "mcp__db__query"],
+      );
+      assert.deepEqual(
+        denyNames({ ...closed, groups: [{ name: "mcp", patterns: ["mcp__*"], alwaysOpen: "yes" }] }, names, new Set()),
+        ["mcp__git__status", "mcp__db__query"],
+      );
+    });
+
+    it("normalizes only a literal true and leaves the stored policy byte-identical", () => {
+      const normalized = normalizeSettings({
+        presets: {
+          alpha: { disabled: [], groups: [{ name: "a", patterns: ["read"], alwaysOpen: true }] },
+          beta: { disabled: [], groups: [{ name: "b", patterns: ["read"], alwaysOpen: "yes" }] },
+          gamma: { disabled: [], groups: [{ name: "c", patterns: ["read"], alwaysOpen: false }] },
+          delta: { disabled: [], groups: [{ name: "d", patterns: ["read"], alwaysOpen: 1 }] },
+          epsilon: { disabled: [], groups: [{ name: "e", patterns: ["read"] }] },
+          zeta: { disabled: [], groups: [{ name: "f", patterns: ["read"], alwaysOpen: null }] },
+        },
+      });
+      assert.deepEqual(normalized.presets.alpha, {
+        disabled: [],
+        groups: [{ name: "a", patterns: ["read"], alwaysOpen: true }],
+      });
+      for (const presetId of ["beta", "gamma", "delta", "epsilon", "zeta"]) {
+        assert.deepEqual(
+          normalized.presets[presetId],
+          { disabled: [], groups: [{ name: normalized.presets[presetId].groups[0].name, patterns: ["read"] }] },
+        );
+        assert.equal(Object.hasOwn(normalized.presets[presetId].groups[0], "alwaysOpen"), false);
+      }
+    });
+
+    it("carries the flag into resolved group views", () => {
+      const policy = {
+        disabled: [],
+        groups: [
+          { name: "mcp", description: "MCP tools", patterns: ["mcp__*"], alwaysOpen: true },
+          { name: "web", patterns: ["web_*"] },
+        ],
+      };
+      assert.deepEqual(resolveGroups(policy, names), [
+        {
+          name: "mcp",
+          description: "MCP tools",
+          patterns: ["mcp__*"],
+          tools: ["mcp__git__status", "mcp__db__query"],
+          alwaysOpen: true,
+        },
+        { name: "web", patterns: ["web_*"], tools: ["web_fetch"] },
+      ]);
+      assert.deepEqual(
+        resolveActiveGroups(policy, names).map((group) => [group.name, group.alwaysOpen === true]),
+        [["mcp", true], ["web", false]],
+      );
+    });
+
+    it("reports an always-open group as exposed regardless of exposures", () => {
+      const groups = [
+        { name: "mcp", description: "MCP tools", patterns: ["mcp__*"], tools: ["mcp__a"], alwaysOpen: true },
+        { name: "web", patterns: ["web_*"], tools: ["web_fetch"] },
+        { name: "opened", patterns: ["web_search"], tools: ["web_search"] },
+      ];
+      assert.deepEqual(listGroupViews(groups, new Set()), [
+        { name: "mcp", description: "MCP tools", exposed: true },
+        { name: "web", exposed: false },
+        { name: "opened", exposed: false },
+      ]);
+      assert.deepEqual(listGroupViews(groups, new Set(["web"])), [
+        { name: "mcp", description: "MCP tools", exposed: true },
+        { name: "web", exposed: true },
+        { name: "opened", exposed: false },
+      ]);
+    });
+
+    it("still lists an always-open group in the catalog and remains addressable", () => {
+      const policy = {
+        disabled: [],
+        groups: [{ name: "mcp", patterns: ["mcp__*"], alwaysOpen: true }],
+      };
+      const active = resolveActiveGroups(policy, names);
+      assert.deepEqual(active.map((group) => group.name), ["mcp"]);
+      assert.equal(findGroup(active, "mcp")?.name, "mcp");
+    });
+  });
 });

@@ -97,10 +97,13 @@ interface ToolManagerSettings {
       name: string
       description?: string
       patterns: string[] // exact names from the settings UI; older `*` wildcards still match
+      alwaysOpen?: boolean // true = open in every session from the first step; only a literal true enables it
     }>
   }>
 }
 ```
+
+`alwaysOpen` 是**静态策略**，与会话级的 `exposure` 状态正交：曝光集合仍只由该会话成功的 `tool_list` 调用（及其事件日志恢复）构成，两者在 `denyNames()` 里各自独立地决定成员是否隐藏。
 
 ### 3.2 优先级
 
@@ -108,11 +111,11 @@ interface ToolManagerSettings {
 
 1. DSH 其他安全 restriction / guard；
 2. 本插件 `disabled`；
-3. 按需组默认隐藏；
+3. 按需组默认隐藏；标记为 `alwaysOpen` 的组不参与这一条，它的成员从一开始就可见；
 4. `tool_list(group)` 打开该组（当前会话一直可用）；
 5. 原始 Preset 工具目录。
 
-显式 disabled 永远不能被临时曝光反向开启。PTC 的 `run_code` 永远不会进入 deny 集合。`tool_list` 注册在 host 全局层；没有按需组的 Preset 会把它 deny 掉。
+显式 disabled 永远不能被临时曝光反向开启，也不能被 `alwaysOpen` 反向开启：`denyNames()` 先跳过默认开放组，再独立地把 `disabled` 加入隐藏集合。PTC 的 `run_code` 永远不会进入 deny 集合。`tool_list` 注册在 host 全局层；没有按需组的 Preset 会把它 deny 掉——默认开放组仍算按需组，因此包含默认开放组的 Preset 不会隐藏 `tool_list`。
 
 ### 3.3 `tool_list` 语义
 
