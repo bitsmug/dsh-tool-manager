@@ -54,7 +54,6 @@ export interface PresetOrphans {
 export interface PresetCatalogView {
   id: string;
   name?: string;
-  trust?: "system" | "user";
   isDefault: boolean;
   broken?: string;
   tools: ToolSchemaView[];

@@ -142,6 +142,377 @@ describe("ToolPolicyRuntime restart recovery", () => {
     await runtime.dispose();
   });
 
+  it("filters section text when DSH assembles without tool declarations (0.2.2 fallback)", async () => {
+    const schemas = ["read", "subagent"].map((name) => ({ name, description: name, parameters: {} }));
+    let guard;
+    let assemble;
+    const warnings = [];
+    const scopedTools = {
+      schemas() { return schemas; },
+      register() { throw new Error("scope register should not be used"); },
+      restrict() { throw new Error('tool "subagent" is scoped, not globally restrictable; known global tools: read'); },
+      guard(callback) { guard = callback; return () => {}; },
+    };
+    const agent = {
+      ctx: {
+        get(name) { return name === "tools" ? scopedTools : undefined; },
+        on(name, handler) { if (name === "system-prompt/assemble") assemble = handler; return () => {}; },
+      },
+      session: resumedSession(),
+    };
+    const context = {
+      get(name) {
+        if (name === "tools") return { schemas() { return schemas; }, register() { return () => {}; } };
+        if (name === "agents") return { list: () => [agent] };
+        if (name === "logger") return { warn: (message) => warnings.push(message) };
+        return undefined;
+      },
+      on() {},
+    };
+    const presets = { composedPreset: () => "standard" };
+    const runtime = new ToolPolicyRuntime(context, presets, {
+      presets: { standard: { disabled: ["subagent"], groups: [] } },
+    });
+    runtime.start();
+
+    // DSH >= 0.2.2 hands over a PromptPresentation: sections/contexts/variables
+    // only, and re-attaches the registry's tool declarations after the
+    // waterfall.
+    const presentation = () => ({
+      sections: [{ name: "tool:read" }, { name: "tool:subagent" }, { name: "identity" }],
+      contexts: [],
+      variables: {},
+    });
+
+    const filtered = await assemble({}, {}, async () => presentation());
+    assert.deepEqual(filtered.sections.map((item) => item.name), ["tool:read", "identity"]);
+    assert.equal("tools" in filtered, false);
+    assert.match(guard({ name: "subagent" }), /disabled by the tool-manager policy/);
+
+    // The Agent-scoped tool cannot be hidden from the prompt any more, so the
+    // runtime must say so once instead of failing silently.
+    const limitation = warnings.filter((message) => /Agent-scoped tool/.test(message));
+    assert.equal(limitation.length, 1);
+    assert.match(limitation[0], /subagent/);
+
+    await assemble({}, {}, async () => presentation());
+    assert.equal(warnings.filter((message) => /Agent-scoped tool/.test(message)).length, 1);
+    await runtime.dispose();
+  });
+
+  it("drops prompt sections that only introduce a fully hidden tool family", async () => {
+    const schemas = [
+      "tool_list",
+      "read",
+      "list_mcp_resources",
+      "list_mcp_resource_templates",
+      "read_mcp_resource",
+      "mcp__playwright__browser_navigate",
+      "mcp__playwright__browser_close",
+    ].map((name) => ({ name, description: name, parameters: {} }));
+    let assemble;
+    let discovery;
+    const scopedTools = {
+      schemas() { return schemas; },
+      register() { throw new Error("scope register should not be used"); },
+      restrict() { return () => {}; },
+      guard() { return () => {}; },
+    };
+    const agent = {
+      ctx: {
+        get(name) { return name === "tools" ? scopedTools : undefined; },
+        on(name, handler) { if (name === "system-prompt/assemble") assemble = handler; return () => {}; },
+      },
+      session: resumedSession(),
+    };
+    const context = {
+      get(name) {
+        if (name === "tools") return {
+          schemas() { return schemas; },
+          register(definition) { discovery = definition; return () => {}; },
+        };
+        if (name === "agents") return { list: () => [agent] };
+        return undefined;
+      },
+      on() {},
+    };
+    const runtime = new ToolPolicyRuntime(context, { composedPreset: () => "standard" }, {
+      presets: {
+        standard: {
+          disabled: [],
+          groups: [
+            {
+              name: "MCP资源浏览",
+              patterns: ["list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"],
+            },
+            {
+              name: "浏览器自动化",
+              patterns: ["mcp__playwright__browser_navigate", "mcp__playwright__browser_close"],
+            },
+          ],
+        },
+      },
+    });
+    runtime.start();
+
+    const presentation = () => ({
+      sections: [
+        { name: "tool:read" },
+        { name: "tool:list_mcp_resources" },
+        { name: "mcp-resource-servers" },
+        { name: "mcp:playwright" },
+        { name: "mcp:nonexistent" },
+        { name: "identity" },
+      ],
+      contexts: [],
+      variables: {},
+    });
+    const kept = async () => (await assemble({}, {}, async () => presentation()))
+      .sections.map((section) => section.name);
+
+    // Both groups are closed, so every advertised tool is hidden and the
+    // sections that exist only for them go too. A section whose family
+    // registered no tools stays: nothing is hidden, nothing is stale.
+    assert.deepEqual(await kept(), ["tool:read", "mcp:nonexistent", "identity"]);
+
+    // One visible tool is enough to keep its family's section.
+    await discovery.execute({ group: "MCP资源浏览" }, { agent });
+    assert.deepEqual(await kept(), [
+      "tool:read",
+      "tool:list_mcp_resources",
+      "mcp-resource-servers",
+      "mcp:nonexistent",
+      "identity",
+    ]);
+
+    // Same for an MCP server's own instruction section: opening its group
+    // restores it, closing it removes it again.
+    await discovery.execute({ group: "浏览器自动化" }, { agent });
+    assert.deepEqual(await kept(), [
+      "tool:read",
+      "tool:list_mcp_resources",
+      "mcp-resource-servers",
+      "mcp:playwright",
+      "mcp:nonexistent",
+      "identity",
+    ]);
+
+    // A partially hidden family keeps its section while a sibling is callable.
+    runtime.update({
+      presets: {
+        standard: {
+          disabled: [
+            "mcp__playwright__browser_navigate",
+            "list_mcp_resources",
+            "list_mcp_resource_templates",
+            "read_mcp_resource",
+          ],
+          groups: [],
+        },
+      },
+    });
+    assert.deepEqual(await kept(), ["tool:read", "mcp:playwright", "mcp:nonexistent", "identity"]);
+
+    // Hiding the last member removes the server instructions with it.
+    runtime.update({
+      presets: {
+        standard: {
+          disabled: [
+            "mcp__playwright__browser_navigate",
+            "mcp__playwright__browser_close",
+            "list_mcp_resources",
+            "list_mcp_resource_templates",
+            "read_mcp_resource",
+          ],
+          groups: [],
+        },
+      },
+    });
+    assert.deepEqual(await kept(), ["tool:read", "mcp:nonexistent", "identity"]);
+    await runtime.dispose();
+  });
+
+  it("folds sections by preset policy when an upstream restrict already shrank the baseline", async () => {
+    // Issue #3: a delegated child Agent joins the parent's preset, but its tool
+    // surface was narrowed by `childCtx.tools.restrict(toolFilter)` before this
+    // plugin installed. The folded tools are therefore absent from the
+    // baseline, `denyNames()` returns nothing, and only the policy itself still
+    // proves the section is stale.
+    const schemas = ["tool_list", "read"].map((name) => ({ name, description: name, parameters: {} }));
+    let assemble;
+    const warnings = [];
+    const scopedTools = {
+      schemas() { return schemas; },
+      register() { throw new Error("scope register should not be used"); },
+      restrict() { return () => {}; },
+      guard() { return () => {}; },
+    };
+    const agent = {
+      ctx: {
+        get(name) { return name === "tools" ? scopedTools : undefined; },
+        on(name, handler) { if (name === "system-prompt/assemble") assemble = handler; return () => {}; },
+      },
+      session: resumedSession(),
+    };
+    const context = {
+      get(name) {
+        if (name === "tools") return { schemas() { return schemas; }, register() { return () => {}; } };
+        if (name === "agents") return { list: () => [agent] };
+        if (name === "logger") return { warn: (message) => warnings.push(message) };
+        return undefined;
+      },
+      on() {},
+    };
+    const runtime = new ToolPolicyRuntime(context, { composedPreset: () => "standard" }, {
+      presets: {
+        standard: {
+          disabled: ["orphan_tool"],
+          groups: [
+            { name: "bilibili", patterns: ["bilibili_extract", "bilibili_login", "bilibili_doctor"] },
+            { name: "MCP资源浏览", patterns: ["list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"] },
+            { name: "浏览器自动化", patterns: ["mcp__playwright__*"] },
+          ],
+        },
+      },
+    });
+    runtime.start();
+
+    const kept = async () => (await assemble({}, {}, async () => ({
+      sections: [
+        { name: "tool:read" },
+        { name: "tool:bilibili_extract" },
+        { name: "tool:orphan_tool" },
+        { name: "mcp-resource-servers" },
+        { name: "mcp:playwright" },
+        { name: "identity" },
+      ],
+      contexts: [],
+      variables: {},
+    }))).sections.map((section) => section.name);
+
+    // Nothing here is in the baseline, yet every folded or disabled family is
+    // gone: the section follows the preset declaration, not this Agent's
+    // inherited surface. `tool:read` and the unowned `identity` stay.
+    assert.deepEqual(await kept(), ["tool:read", "identity"]);
+    // Folding is silent: the fallback warning is about declarations, not here.
+    assert.deepEqual(warnings.filter((message) => /Agent-scoped tool/.test(message)), []);
+    await runtime.dispose();
+  });
+
+  it("keeps every section when the preset has no policy at all", async () => {
+    const schemas = ["read"].map((name) => ({ name, description: name, parameters: {} }));
+    let assemble;
+    const scopedTools = {
+      schemas() { return schemas; },
+      register() { throw new Error("scope register should not be used"); },
+      restrict() { return () => {}; },
+      guard() { return () => {}; },
+    };
+    const agent = {
+      ctx: {
+        get(name) { return name === "tools" ? scopedTools : undefined; },
+        on(name, handler) { if (name === "system-prompt/assemble") assemble = handler; return () => {}; },
+      },
+      session: resumedSession(),
+    };
+    const context = {
+      get(name) {
+        if (name === "tools") return { schemas() { return schemas; }, register() { return () => {}; } };
+        if (name === "agents") return { list: () => [agent] };
+        return undefined;
+      },
+      on() {},
+    };
+    const runtime = new ToolPolicyRuntime(context, { composedPreset: () => "minimal" }, { presets: {} });
+    runtime.start();
+
+    const sections = [
+      { name: "tool:read" },
+      { name: "tool:bilibili_extract" },
+      { name: "mcp-resource-servers" },
+      { name: "identity" },
+    ];
+    const filtered = await assemble({}, {}, async () => ({ sections, contexts: [], variables: {} }));
+    assert.deepEqual(filtered.sections.map((section) => section.name), sections.map((section) => section.name));
+    await runtime.dispose();
+  });
+
+  it("hides Agent-scoped tools from the per-step tool set (0.2.2)", async () => {
+    const globals = ["read"];
+    const own = ["subagent"];
+    const byName = new Map([...globals, ...own].map((name) => [name, { name, description: name, parameters: {} }]));
+    class ScopedTools {
+      denied = new Set();
+      schemas() { return [...byName.values()]; }
+      register() { return () => {}; }
+      restrict({ deny }) {
+        const unknown = deny.filter((name) => !globals.includes(name));
+        if (unknown.length > 0) {
+          throw new Error(`tools.restrict() names unknown global tools ${unknown.map((name) => `"${name}"`).join(", ")}; known global tools: ${globals.join(", ")}`);
+        }
+        this.denied = new Set(deny);
+        return () => { this.denied = new Set(); };
+      }
+      guard() { return () => {}; }
+      async resolve() {
+        const owner = this;
+        return {
+          dispose() {},
+          view() {
+            const admitted = new Map();
+            for (const name of [...globals.filter((item) => !owner.denied.has(item)), ...own]) {
+              admitted.set(name, byName.get(name));
+            }
+            return admitted;
+          },
+        };
+      }
+    }
+
+    const tools = new ScopedTools();
+    let assemble;
+    const warnings = [];
+    const agent = {
+      ctx: {
+        get(name) { return name === "tools" ? tools : undefined; },
+        on(name, handler) { if (name === "system-prompt/assemble") assemble = handler; return () => {}; },
+      },
+      session: resumedSession(),
+    };
+    const context = {
+      get(name) {
+        if (name === "tools") return tools;
+        if (name === "agents") return { list: () => [agent] };
+        if (name === "logger") return { warn: (message) => warnings.push(message) };
+        return undefined;
+      },
+      on() {},
+    };
+    const presets = { composedPreset: () => "standard" };
+    const runtime = new ToolPolicyRuntime(context, presets, {
+      presets: { standard: { disabled: ["subagent"], groups: [] } },
+    });
+    runtime.start();
+
+    const signal = new AbortController().signal;
+    const set = await tools.resolve({ agent, modelSelection: { provider: "p", model: "m" }, signal });
+    assert.deepEqual([...set.view(agent).keys()], ["read"]);
+    set.dispose();
+
+    // The declarations are already filtered, so the fallback warning must stay silent.
+    await assemble({}, {}, async () => ({
+      sections: [{ name: "tool:read" }, { name: "tool:subagent" }],
+      contexts: [],
+      variables: {},
+    }));
+    assert.deepEqual(warnings.filter((message) => /Agent-scoped tool/.test(message)), []);
+
+    // Unloading restores the Host's own resolve().
+    await runtime.dispose();
+    const restored = await tools.resolve({ agent, modelSelection: { provider: "p", model: "m" }, signal });
+    assert.deepEqual([...restored.view(agent).keys()].sort(), ["read", "subagent"]);
+  });
+
   it("explains when a tool's on-demand group must be opened first", async () => {
     const schemas = ["tool_list", "plugin_manager", "subagent"].map((name) => ({
       name,
@@ -488,6 +859,215 @@ describe("ToolPolicyRuntime restart recovery", () => {
     runtime.start();
 
     assert.deepEqual(applied.at(-1), ["web_search", "write"]);
+    await runtime.dispose();
+  });
+});
+
+describe("ToolPolicyRuntime registry reload", () => {
+  it("follows the live registry, forgets its observations, and keeps the policy", async () => {
+    const denies = [];
+    const scopedSchemas = ["read", "subagent"].map((name) => ({ name, description: name, parameters: {} }));
+    const scopedTools = {
+      schemas() { return scopedSchemas; },
+      register() { return () => {}; },
+      restrict(filter) { denies.push(filter.deny); return () => {}; },
+    };
+    const agent = {
+      ctx: { get(name) { return name === "tools" ? scopedTools : undefined; }, on() { return () => {}; } },
+      session: resumedSession(),
+    };
+    const context = {
+      get(name) {
+        if (name === "tools") return { schemas: () => [], register: () => () => {}, restrict: () => () => {} };
+        if (name === "agents") return { list: () => [agent] };
+        if (name === "logger") return { warn() {} };
+        return undefined;
+      },
+      on() {},
+    };
+    const seen = [];
+    let instance = { composedPreset() { seen.push("first"); return "standard"; } };
+
+    const runtime = new ToolPolicyRuntime(context, () => instance, {
+      presets: { standard: { disabled: ["subagent"], groups: [] } },
+    });
+    runtime.start();
+    assert.deepEqual(runtime.observedSchemasFor("standard").map((item) => item.name), ["read", "subagent"]);
+    assert.deepEqual(denies.at(-1), ["subagent"]);
+
+    // DSH republished the registry: the new instance has no bindings yet, and
+    // preset ids from the retired one no longer name a composition it owns.
+    instance = { composedPreset() { seen.push("second"); return undefined; } };
+    runtime.update({ presets: { standard: { disabled: ["subagent"], groups: [] } } });
+
+    assert.equal(seen.at(-1), "second");
+    assert.deepEqual(runtime.observedSchemasFor("standard"), []);
+    // A Session DSH can no longer report a preset for keeps the policy it was
+    // running under: silently re-enabling every disabled tool is worse.
+    assert.deepEqual(denies.at(-1), ["subagent"]);
+    await runtime.dispose();
+  });
+});
+
+describe("a tool registered after the baseline snapshot", () => {
+  function host() {
+    const schema = (name) => ({ name, description: name, parameters: {} });
+    let names = ["read"];
+    let restricted = new Set();
+    let guard;
+    let stepSet;
+    const listeners = new Map();
+    /** The Agent-scoped service: `restrict()` removes names from what it shows. */
+    const visible = () => names.filter((name) => !restricted.has(name)).map(schema);
+    const scopedTools = {
+      schemas: visible,
+      register: () => () => {},
+      restrict({ deny }) {
+        restricted = new Set(deny);
+        return () => {
+          restricted = new Set();
+        };
+      },
+      guard(callback) {
+        guard = callback;
+        return () => {};
+      },
+    };
+    const agent = {
+      id: "session-1",
+      ctx: {
+        get: (name) => (name === "tools" ? scopedTools : undefined),
+        on: () => () => {},
+      },
+      session: { seq: 0, eventAt: () => undefined, surface: { nodes: [] } },
+    };
+    const hostTools = {
+      schemas: visible,
+      register: () => () => {},
+      restrict: () => () => {},
+      // The real host service owns `resolve`; the plugin patches it in place.
+      async resolve() {
+        stepSet = {
+          dispose() {},
+          view: () => new Map(visible().map((item) => [item.name, item])),
+        };
+        return stepSet;
+      },
+    };
+    const context = {
+      get(name) {
+        if (name === "tools") return hostTools;
+        if (name === "agents") return { list: () => [agent] };
+        return undefined;
+      },
+      on(event, listener) {
+        listeners.set(event, [...(listeners.get(event) ?? []), listener]);
+        return () => {};
+      },
+    };
+    const settings = {
+      presets: {
+        standard: {
+          disabled: [],
+          groups: [{ name: "GitHub", description: "github", patterns: ["github_*"] }],
+        },
+      },
+    };
+    return {
+      agent,
+      context,
+      hostTools,
+      listeners,
+      settings,
+      get guard() {
+        return guard;
+      },
+      get stepSet() {
+        return stepSet;
+      },
+      get restricted() {
+        return [...restricted];
+      },
+      visibleNames() {
+        return visible().map((item) => item.name);
+      },
+      addLateTool() {
+        names = ["read", "github_search"];
+      },
+      setTools(next) {
+        names = [...next];
+      },
+    };
+  }
+
+  const presets = { composedPreset: () => "standard" };
+
+  it("joins its on-demand group on the next step without a restart", async () => {
+    const h = host();
+    const runtime = new ToolPolicyRuntime(h.context, presets, h.settings);
+    runtime.start();
+    const preStep = h.listeners.get("agent/pre-step")[0];
+
+    // A plugin installed after this Agent's snapshot registered its tool into
+    // the live surface, but no `tools/change` edge reached the runtime.
+    h.addLateTool();
+
+    const decision = await preStep({ agent: h.agent }, () => ({ kind: "enter", messages: [] }));
+
+    assert.equal(decision.messages.length, 1, "the catalog now names the group");
+    assert.equal(decision.messages[0].source.kind, "tool-manager-catalog");
+    assert.deepEqual(decision.messages[0].source.entries.map((entry) => entry.name), ["GitHub"]);
+    assert.deepEqual(decision.messages[0].source.entries[0].tools, ["github_search"]);
+    assert.match(h.guard({ name: "github_search" }), /belongs to on-demand group "GitHub"/);
+    await runtime.dispose();
+  });
+
+  it("hides the late tool from the step set the host is about to resolve", async () => {
+    const h = host();
+    const runtime = new ToolPolicyRuntime(h.context, presets, h.settings);
+    runtime.start();
+
+    h.addLateTool();
+    const set = await h.hostTools.resolve({ agent: h.agent });
+
+    assert.deepEqual([...set.view().keys()], ["read"]);
+    await runtime.dispose();
+  });
+
+  it("keeps the snapshot when the surface merely shrinks", async () => {
+    const h = host();
+    h.addLateTool();
+    const runtime = new ToolPolicyRuntime(h.context, presets, h.settings);
+    runtime.start();
+    const preStep = h.listeners.get("agent/pre-step")[0];
+
+    // A composition swap can drop a standing layer for one turn; adopting that
+    // gap would un-hide the group's tools, so only growth refreshes the snapshot.
+    h.setTools(["read"]);
+    const decision = await preStep({ agent: h.agent }, () => ({ kind: "enter", messages: [] }));
+
+    assert.deepEqual(decision.messages[0].source.entries.map((entry) => entry.name), ["GitHub"]);
+    assert.deepEqual(decision.messages[0].source.entries[0].tools, ["github_search"]);
+    await runtime.dispose();
+  });
+
+  it("keeps grouped tools in the snapshot while their group is closed", async () => {
+    const h = host();
+    h.setTools(["read", "github_search"]);
+    const runtime = new ToolPolicyRuntime(h.context, presets, h.settings);
+    runtime.start();
+    const preStep = h.listeners.get("agent/pre-step")[0];
+    assert.deepEqual(h.restricted, ["github_search"], "the closed group is denied");
+
+    // A second plugin registers another tool while the group is still closed.
+    // The visible surface hides `github_search`, so a naive re-read would drop
+    // it from the snapshot and lift the group's restriction.
+    h.setTools(["read", "github_search", "gitlab_search"]);
+    const decision = await preStep({ agent: h.agent }, () => ({ kind: "enter", messages: [] }));
+
+    assert.deepEqual(h.restricted, ["github_search"], "the closed group stays denied");
+    assert.deepEqual(h.visibleNames(), ["read", "gitlab_search"]);
+    assert.deepEqual(decision.messages[0].source.entries[0].tools, ["github_search"]);
     await runtime.dispose();
   });
 });

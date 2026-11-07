@@ -8,6 +8,34 @@
 ### Added
 
 - 工具组可标记为“默认开放”：该组在所属 Preset 的每个会话第一步就直接开放，无需模型先调用 `tool_list`；默认开放组仍保留在工具组目录中并标记为已开放。WebUI 分组列表新增“默认开放”开关，配置字段为 `groups[].alwaysOpen`（只认字面量 `true`，缺省、`false` 与其它值均按普通按需组处理）。默认开放不覆盖 `disabled`：显式关闭的工具即使属于默认开放组也仍然隐藏。
+## [1.2.12] - 2026-11-06
+
+### Fixed
+
+- 修复「折叠的 `tool:*` 提示词段在子代理上未被隐藏」（issue #3）。子代理在 tool-manager install 之前就被委派层 `childCtx.tools.restrict(toolFilter)` 裁过工具面，baseline 里可能一个被折叠工具都没有，`denyNames()` 因此返回空、`system-prompt/assemble` 直接放行，全局注册的 `tool:<名称>` 段照旧出现在子代理提示词里。现在段落判定不再只依赖 baseline：只要该工具落在预设的 `disabled` 里，或命中某个未 open 的按需组 patterns，就按「已折叠」处理并删除其说明段；`tool:<名称>`、`mcp:<服务器>`、`mcp-resource-servers` 三种段落都适用。族内成员取 baseline 与实际策略字面名的并集，全部被隐藏才删除，任一可见则保留。
+- 修复「工具已收进按需组或已关闭，系统提示词里却仍保留只介绍这些工具的段落」的问题。此前只按 `tool:<名称>` 剔除单工具说明段，因此 MCP 的 `mcp-resource-servers`（三个共享资源工具）和 `mcp:<服务器>`（服务器 instructions）即使对应工具全部不可见也照样出现在提示词里，模型会读到「可以调用」的指令却找不到工具，调用还会被 guard 拒绝。DSH 的提示词段落没有工具归属元数据，现在按命名约定把段落归到工具族：`tool:<名称>`、`mcp:<服务器>`（该服务器全部 `mcp__<服务器>__*` 工具）、`mcp-resource-servers`（三个共享资源工具）。族内工具**全部**被隐藏时整段删除，任一工具可见则保留；无归属或族内没有注册工具的段落不处理。
+- 修复「安装新插件后，把它的工具加入按需组，新旧会话都不生效，必须重启 DSH」的问题。按需组是否有效取决于该 Agent 的 baseline（继承工具名快照），而 baseline 只在 `install()`（`agent/created`）与 `tools/change` 时刷新；插件热装/组合重载可能把工具注册落在两者之间，于是组解析为 0 个工具、从目录里消失，组内工具反而一直可见，直到重启重建快照。现在每一步都在 `tools.resolve()` 之前、`agent/pre-step` 里以及 `tool_list` 打开组时用 live `schemas(agent)` 核对 baseline（一次 map 遍历）：只要 live 面出现快照没有的名字，就立即采用并 `reconcile()`，新工具在当步就归入按需组并从该步的工具集合中剔除，目录同一步更新，不需要重启。只对「新增」生效——工具面收缩可能是组合切换的空窗，仍交给 `tools/change` 的防抖刷新，避免为一步把组内工具放出来。
+- 修复本插件的 HTTP 路由在插件重载后残留的问题：`context.inject(["webServer"], ...)` 的回调没有保留也没有返回 `webServer.register()` 的 disposer，重载后新实例注册同一路径会抛 `webserver: duplicate exact route`，而旧实例的 handler 仍在服务——设置页会继续读写一个已经没人驱动的 runtime。现在所有路由的 disposer 都被收集，并在注入作用域卸载时统一释放；若中途某条路由被拒绝，已注册的部分也会立刻回滚。
+
+### Changed
+
+- 最低支持的 DSH 版本提升到 `0.2.2-rc.1`（`engines.dsh` 由 `>=0.2.0-rc.2` 改为 `>=0.2.2-rc.1`）。提示词段落隐藏现在依赖 `0.2.2` 的 `PromptPresentation` 语义（工具声明在 waterfall 之后挂回），工具隐藏依赖 `tools.resolve()` 的 per-step 过滤，两者都是 `0.2.2` 才有的能力。仍停留在 `0.2.0` / `0.2.1` 的用户请继续使用 `1.2.11`；升级到 `0.2.2` 前记得移除 `tools.mode` / `DSH_TOOLS_MODE`，并把 Node.js 升到 24.9 以上。
+- README 同步适配范围（`>=0.2.2-rc.1`，旧版用 `1.2.11`）。
+- 版本提升至 `1.2.12`。
+
+## [1.2.11] - 2026-11-05
+
+### Fixed
+
+- 适配 DSH 0.2.2（含 `0.2.2-rc.1`）：`system-prompt/assemble` 的载荷由 `PromptAssembly` 改为 `PromptPresentation`，只带 `sections` / `contexts` / `variables`，工具声明改由工具注册表在 waterfall **之后**挂回。旧实现要求载荷同时包含 `tools` 数组，在 0.2.2 上判断失败并原样返回，导致 `tool:<名称>` 提示词段落不再剔除。现在只要求 `sections`：旧版继续同时过滤工具声明与段落，新版过滤段落文本。
+- 恢复 DSH 0.2.2 上「所有工具都能隐藏」的行为：新增 per-step 过滤，包装 `tools.resolve()` 返回的准入集合，把策略隐藏的工具名从该步的工具集合中剔除。0.2.2 的提示词工具声明、PTC 绑定与执行查找全部由这份集合派生，因此按 **Agent 自身作用域** 注册的工具（`subagent`、`list_subagent_models`、`schedule_*` 等）与全局工具表现一致：未打开按需组或已关闭时，既不在模型工具列表中，也无法调用。这是 `tools.restrict()` 之外的补充路径——`restrict()` 按设计只作用于 global/祖先层，无法隐藏 Agent 自身作用域的注册。包装只改写 `view()` 的投影，失败时原样返回 Host 的集合，插件卸载时还原；旧版 DSH 没有 `resolve()`，自动跳过。
+- 若上述包装无法安装（Host 改动了该接口），保留 0.2.2 的降级路径并**只告警一次**：继续过滤提示词段落，调用仍由 guard 拦截，并列出受影响的工具名。
+
+### Changed
+
+- 移除工具目录快照中的 `trust` 字段：DSH 自 0.1.7 起不再上报 Preset 信任级别，快照此前始终填 `system`，属于误导性数据；设置页从未渲染该字段。
+- README 补充 DSH 0.2.2 的适配范围、Node.js 24.9 最低要求，以及升级前需移除 `tools.mode` / `DSH_TOOLS_MODE` 的提醒。
+- 版本提升至 `1.2.11`；`engines.dsh` 保持 `>=0.2.0-rc.2`，0.2.1 用户无需改变。
 
 ## [1.2.10] - 2026-10-08
 
